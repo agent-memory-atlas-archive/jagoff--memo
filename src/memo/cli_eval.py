@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import click
+from rich.markup import escape
 
 from memo import eval_baseline, eval_recall
 from memo.cli_common import console
@@ -550,6 +551,39 @@ def _validate_against_flags(
         )
 
 
+def _print_quarantine(quarantined: list[tuple[str, list[str]]], *, quiet: bool = False) -> None:
+    """Name the prompts excluded from precision, so they can be re-pointed.
+
+    The gate's erosion message promises this listing; without it the operator
+    is told a count and given nothing to act on.
+    """
+    if quiet or not quarantined:
+        return
+    console.print(
+        f"⚠ {len(quarantined)} prompt(s) excluded from precision: their expect_ids "
+        "ground truth is no longer in the corpus (archived, superseded or merged). "
+        "Re-point them at the records that replaced them:",
+        markup=False,
+    )
+    for text, ids in quarantined:
+        console.print(f"    {text[:64]!r} -> {', '.join(ids)}", markup=False)
+
+
+def _print_verdict(label: str, *, passed: bool, message: str) -> None:
+    """Print a gate verdict without letting rich eat its attribution.
+
+    Gate messages deliberately carry their own brackets — `FAIL [code · config
+    'L live/vec/0.4'] — ...` — which say whether the drop is code-attributable
+    or corpus-confounded, and which config the numbers describe. `console.print`
+    reads those as style tags and silently DELETES them, so the terminal showed
+    `FAIL  — precision@k 0.316 ...` and the attribution reached nobody. Escape
+    the message; keep markup for the mark itself.
+    """
+    color = "green" if passed else "red"
+    mark = "✓" if passed else "✗"
+    console.print(f"[{color}]{mark}[/{color}] {label}: {escape(message)}")
+
+
 def _run_against(
     against_ref: str,
     *,
@@ -811,10 +845,17 @@ def eval_recall_cmd(
         if as_json:
             click.echo(json.dumps(against_result.__dict__, ensure_ascii=False, indent=2))
         else:
-            color = "green" if against_result.passed else "red"
-            mark = "✓" if against_result.passed else "✗"
-            console.print(f"[{color}]{mark}[/{color}] vs {against_ref}: {against_result.message}")
+            _print_verdict(
+                f"vs {against_ref}",
+                passed=against_result.passed,
+                message=against_result.message,
+            )
         sys.exit(0 if against_result.passed else 1)
+
+    _print_quarantine(
+        eval_recall.retired_prompts(labels, lambda pref: eval_recall._memory_exists(mem, pref)),
+        quiet=as_json,
+    )
 
     if update_baseline:
         # Persist the FULL metrics (precision/noise ∪ avoid@k / avoid_leak@k) so
@@ -850,9 +891,7 @@ def eval_recall_cmd(
         if as_json:
             click.echo(json.dumps(result.__dict__, ensure_ascii=False, indent=2))
         else:
-            color = "green" if result.passed else "red"
-            mark = "✓" if result.passed else "✗"
-            console.print(f"[{color}]{mark}[/{color}] recall gate: {result.message}")
+            _print_verdict("recall gate", passed=result.passed, message=result.message)
         sys.exit(0 if result.passed else 1)
 
     if as_json:
@@ -1077,9 +1116,7 @@ def eval_tokens_cmd(
         if as_json:
             click.echo(json.dumps(result.__dict__, ensure_ascii=False, indent=2))
         else:
-            color = "green" if result.passed else "red"
-            mark = "✓" if result.passed else "✗"
-            console.print(f"[{color}]{mark}[/{color}] token gate: {result.message}")
+            _print_verdict("token gate", passed=result.passed, message=result.message)
         sys.exit(0 if result.passed else 1)
 
     if as_json:

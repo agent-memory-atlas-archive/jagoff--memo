@@ -273,6 +273,32 @@ class Cfg:
     live: bool = False
 
 
+# The live config's display name embeds the live mode and floor, both of which
+# the tuner moves. `gate_config_key` collapses every variant onto this prefix so
+# the gate keeps its grip on the config across a knob move.
+_LIVE_CONFIG_PREFIX = "L live"
+
+
+def gate_config_key(config: str) -> str:
+    """Stable identity for gate pinning, derived from a config's display name.
+
+    The grid configs name a PINNED floor (`A vec/0.60/keep`), so their display
+    name IS their identity. The live config does not: it is defined as "whatever
+    the hook ranks with right now", and its name renders the floor it inherited
+    (`L live/vec/0.4`) — a value the dream tuner rewrites in the overlay.
+
+    Pinning the gate on that display name therefore breaks it the moment the
+    tuner does its job: the baseline names a config no later run can reproduce,
+    the gate fails on identity for EVERY diff, and the precision delta it exists
+    to catch is never computed. That is the "a gate that cannot fail is worse
+    than no gate" shape, one layer up from the knob.
+
+    So live variants collapse onto one key. A floor move is then measured, not
+    excused: it shows up as a precision/noise delta on a comparable config.
+    """
+    return _LIVE_CONFIG_PREFIX if config.startswith(_LIVE_CONFIG_PREFIX) else config
+
+
 def live_config() -> Cfg:
     """The config that mirrors what the recall hook actually runs today.
 
@@ -297,7 +323,7 @@ def live_config() -> Cfg:
     mode = flag_str("MEMO_RECALL_MODE") or "vec"
     floor = flag_float("MEMO_RECALL_MIN_SIM")
     return Cfg(
-        f"L live/{mode}/{0.5 if floor is None else floor:g}",
+        f"{_LIVE_CONFIG_PREFIX}/{mode}/{0.5 if floor is None else floor:g}",
         mode,
         0.5 if floor is None else floor,  # descriptive; `live` inherits at runtime
         exclude_archived=True,
@@ -473,6 +499,52 @@ def hit_is_noise(rec: Any, prompt: Prompt, labels: LabelSet) -> bool:
     return _is_noise(rec, labels) or _id_matches(getattr(rec, "id", ""), prompt.avoid_ids)
 
 
+def retired_prompts(labels: LabelSet, exists: Callable[[str], bool]) -> list[tuple[str, list[str]]]:
+    """Prompts whose ENTIRE `expect_ids` ground truth is gone from the corpus.
+
+    memo archives, supersedes and merges memories every night, by design. The
+    curated label set has no lifecycle coupling to the corpus it labels, so a
+    label quietly stops being satisfiable the moment maintenance retires the
+    note it names. Scoring that prompt as a retrieval miss is simply the wrong
+    measurement: precision@k drops, nothing in retrieval changed, and the
+    number stops being comparable to a baseline taken while the note was live.
+
+    So those prompts are quarantined — excluded from precision and counted,
+    never silently charged to the ranker. A PARTIALLY retired label is left
+    alone: a surviving id can still satisfy it.
+    """
+    out: list[tuple[str, list[str]]] = []
+    for prompt in labels.prompts:
+        if not prompt.expect_ids:
+            continue
+        if not any(exists(e) for e in prompt.expect_ids):
+            out.append((prompt.text, list(prompt.expect_ids)))
+    return out
+
+
+def _memory_exists(mem: Any, id_prefix: str) -> bool:
+    """Can `id_prefix` still be returned by search on this corpus?
+
+    `Memory.get` is the right oracle rather than a raw index lookup: it reports
+    None for a soft-deleted row too, and a memory the archive pass retired is
+    exactly as unreachable to the ranker as one that was never saved.
+    """
+    from memo.errors import MemoError
+
+    getter = getattr(mem, "get", None)
+    if getter is None:
+        # A retrieval-only double (several harness tests pass one) cannot
+        # resolve ids. Report present: quarantining on an unanswerable question
+        # would silently drop prompts from precision.
+        return True
+    try:
+        return getter(id_prefix) is not None
+    except MemoError:
+        # An ambiguous prefix matched at least one record; treat the ground
+        # truth as present rather than quarantining a live label.
+        return True
+
+
 def _id_matches(hit_id: str, expect_ids: list[str]) -> bool:
     a = (hit_id or "").strip().lower()
     for raw in expect_ids:
@@ -566,6 +638,9 @@ class Row:
     hub_noise_rate: float = 0.0
     latency_ms_graph: float = 0.0
     latency_ms_p50: float = 0.0
+    # Prompts excluded from precision because their expect_ids ground truth has
+    # been retired from the live corpus (see `retired_prompts`).
+    quarantined: int = 0
     detail: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -835,10 +910,12 @@ def _run_config_inner(
         _excl.add(FAILURE_PATTERN_TYPE)
     exclude_types = _excl or None
     exclude_tags = uncertain_exclusion()
+    retired = retired_prompts(labels, lambda pref: _memory_exists(mem, pref))
+    retired_texts = {t for t, _ in retired}
     for index, prompt in enumerate(labels.prompts, start=1):
         if progress is not None:
             progress(cfg, index, len(labels.prompts))
-        scored = prompt.relevant or bool(prompt.expect_ids)
+        scored = (prompt.relevant or bool(prompt.expect_ids)) and prompt.text not in retired_texts
         query = (
             f"{labels.session_context}\n{prompt.text}"
             if cfg.context and labels.session_context
@@ -991,6 +1068,7 @@ def _run_config_inner(
         hub_noise_rate=graph_metrics["hub_noise_rate"],
         latency_ms_graph=graph_metrics["latency_ms_graph"],
         latency_ms_p50=round(lat[len(lat) // 2], 1) if lat else 0.0,
+        quarantined=len(retired),
         detail=detail,
     )
 
@@ -1297,7 +1375,14 @@ def full_gate_metrics(rows: list[Row]) -> dict[str, Any]:
     leak ceiling 1.0) and the ``config`` key (comparison falls back to the
     current best config, as before).
     """
-    return {"config": best_row(rows).config, **gate_metrics(rows), **avoid_gate_metrics(rows)}
+    return {
+        "config": best_row(rows).config,
+        # How much ground truth was already retired when this was blessed, so
+        # the gate can catch FURTHER erosion without inventing a threshold.
+        "quarantined": best_row(rows).quarantined,
+        **gate_metrics(rows),
+        **avoid_gate_metrics(rows),
+    }
 
 
 def baseline_payload(
@@ -1320,6 +1405,71 @@ def baseline_payload(
         "labels_fingerprint": labels_fingerprint,
         "corpus_fingerprint": corpus_fingerprint,
     }
+
+
+def _identity_mismatch_message(
+    baseline: dict[str, Any], labels_fingerprint: str | None, k: int | None
+) -> str | None:
+    """Reasons the baseline is not comparable at all, independent of any metric.
+
+    A changed label set and a different top-K both make the saved numbers
+    describe a different measurement, so they fail fast and loudly rather than
+    quietly comparing precision@3 against precision@5.
+    """
+    baseline_fingerprint = str(baseline.get("labels_fingerprint") or "")
+    if labels_fingerprint and baseline_fingerprint and labels_fingerprint != baseline_fingerprint:
+        return (
+            "FAIL — label set changed "
+            f"({baseline_fingerprint} -> {labels_fingerprint}); verify the prior label set, "
+            "then refresh the baseline with --update-baseline"
+        )
+    baseline_k = baseline.get("k")
+    if k is not None and baseline_k is not None and int(baseline_k) != int(k):
+        return (
+            f"FAIL — k mismatch (baseline k={int(baseline_k)}, current k={int(k)}); "
+            "the baseline was measured at a different top-K — reseed it at this k "
+            "with --update-baseline, or run the gate at the baseline k"
+        )
+    return None
+
+
+def _pin_row(rows: list[Row], baseline_config: str, *, default: Row) -> Row | None:
+    """The row the baseline pins, by exact name then by stable key.
+
+    The key fallback is what lets the pin survive a tuner knob move: the live
+    config's display name carries the floor it inherited, so an exact match
+    misses the moment that floor changes (see :func:`gate_config_key`).
+
+    A legacy baseline that recorded no config falls back to ``default`` (the
+    current best), as before. A baseline that names a config this run cannot
+    produce returns None, so the caller fails loudly instead of comparing
+    apples to oranges.
+    """
+    if not baseline_config:
+        return default
+    exact = next((r for r in rows if r.config == baseline_config), None)
+    if exact is not None:
+        return exact
+    key = gate_config_key(baseline_config)
+    return next((r for r in rows if gate_config_key(r.config) == key), None)
+
+
+def _label_erosion_message(current: int, baseline_count: Any) -> str | None:
+    """Wording for a label set that lost more ground truth than at baseline.
+
+    Gated on CHANGE, not on a threshold: the rot already present when the
+    baseline was blessed must not block every push, and repairing labels (a
+    LOWER count) can never read as a regression.
+    """
+    if baseline_count is None or current <= int(baseline_count):
+        return None
+    return (
+        f"FAIL — label set eroded: {current} prompts now have no live ground "
+        f"truth, up from {int(baseline_count)} at baseline. Their expect_ids name "
+        "memories maintenance has since archived or merged, so no ranker can "
+        "satisfy them. Re-point them at the records that replaced them "
+        "(`memo eval recall --labels <set>` lists them), then refresh the baseline."
+    )
 
 
 def _gate_failure_message(
@@ -1410,49 +1560,38 @@ def check_gate(
     )
 
     # --- identity guards (fail fast, before any metric comparison) ---
-    baseline_fingerprint = str(baseline.get("labels_fingerprint") or "")
-    if labels_fingerprint and baseline_fingerprint and labels_fingerprint != baseline_fingerprint:
-        message = (
-            "FAIL — label set changed "
-            f"({baseline_fingerprint} -> {labels_fingerprint}); verify the prior label set, "
-            "then refresh the baseline with --update-baseline"
-        )
+    identity = _identity_mismatch_message(baseline, labels_fingerprint, k)
+    if identity is not None:
         return GateResult(
-            False, message, current_best.precision_at_k, current_best.noise_at_k, bp, bn
-        )
-
-    baseline_k = baseline.get("k")
-    if k is not None and baseline_k is not None and int(baseline_k) != int(k):
-        message = (
-            f"FAIL — k mismatch (baseline k={int(baseline_k)}, current k={int(k)}); "
-            "the baseline was measured at a different top-K — reseed it at this k "
-            "with --update-baseline, or run the gate at the baseline k"
-        )
-        return GateResult(
-            False, message, current_best.precision_at_k, current_best.noise_at_k, bp, bn
+            False, identity, current_best.precision_at_k, current_best.noise_at_k, bp, bn
         )
 
     # Pin the comparison to the baseline's winning config when it recorded one;
     # else (legacy baseline) fall back to the current best config.
-    if baseline_config:
-        gated = next((r for r in rows if r.config == baseline_config), None)
-        if gated is None:
-            ran = ", ".join(r.config for r in rows)
-            message = (
-                f"FAIL — gated config {baseline_config!r} not evaluated this run "
-                f"(ran: {ran}); the baseline pins a config this run did not measure — "
-                "select it, or refresh the baseline with --update-baseline"
-            )
-            return GateResult(
-                False, message, current_best.precision_at_k, current_best.noise_at_k, bp, bn
-            )
-    else:
-        gated = current_best
+    gated = _pin_row(rows, baseline_config, default=current_best)
+    if gated is None:
+        ran = ", ".join(r.config for r in rows)
+        message = (
+            f"FAIL — gated config {baseline_config!r} not evaluated this run "
+            f"(ran: {ran}); the baseline pins a config this run did not measure — "
+            "select it, or refresh the baseline with --update-baseline"
+        )
+        return GateResult(
+            False, message, current_best.precision_at_k, current_best.noise_at_k, bp, bn
+        )
 
     # The config the numbers below describe, on both sides of the comparison.
     config_note = f"config {gated.config!r}"
+    if baseline_config and gated.config != baseline_config:
+        config_note += f" (baseline measured {baseline_config!r})"
     if gated.config != current_best.config:
         config_note += f" (pinned; {current_best.config!r} wins this run)"
+
+    erosion = _label_erosion_message(gated.quarantined, baseline.get("quarantined"))
+    if erosion is not None:
+        return GateResult(
+            False, erosion, gated.precision_at_k, gated.noise_at_k, bp, bn, corpus_changed
+        )
 
     prec_ok = gated.precision_at_k >= bp - tol
     noise_ok = gated.noise_at_k <= bn + tol

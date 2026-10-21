@@ -469,6 +469,46 @@ def test_check_gate_fails_loudly_when_pinned_config_absent_from_run():
     assert "not evaluated" in res.message
 
 
+def test_check_gate_pins_live_config_across_a_tuner_floor_move():
+    # The live config's display name embeds the live floor, and the tuner moves
+    # that floor through the overlay. The baseline was blessed at 0.5; this run
+    # ranks at 0.4. Identity has to survive the knob move, or the gate fails on
+    # a name mismatch for EVERY diff and never compares the metric it exists to
+    # protect — a floor change that costs recall is precisely what it must catch.
+    rows = [eval_recall.Row(config="L live/vec/0.4", precision_at_k=0.316, noise_at_k=0.0)]
+    baseline = {"config": "L live/vec/0.5", "precision_at_k": 0.53, "noise_at_k": 0.041}
+
+    res = eval_recall.check_gate(rows, baseline)
+
+    assert not res.passed
+    assert "precision@k" in res.message  # metric comparison, not identity
+    assert "not evaluated" not in res.message
+    assert "L live/vec/0.5" in res.message  # the floor the baseline was measured at
+    assert "L live/vec/0.4" in res.message  # the floor this run ranked at
+
+
+def test_check_gate_live_pin_passes_when_precision_holds_at_a_new_floor():
+    rows = [eval_recall.Row(config="L live/vec/0.45", precision_at_k=0.55, noise_at_k=0.02)]
+    baseline = {"config": "L live/vec/0.5", "precision_at_k": 0.53, "noise_at_k": 0.041}
+
+    res = eval_recall.check_gate(rows, baseline)
+
+    assert res.passed
+
+
+def test_check_gate_does_not_collapse_distinct_grid_configs():
+    # Only the live config collapses onto a stable key. A grid config names a
+    # PINNED floor, so a baseline on one grid config must never be compared
+    # against another — that would be the apples-to-oranges the pin prevents.
+    rows = [eval_recall.Row(config="A vec/0.60/keep", precision_at_k=0.9, noise_at_k=0.0)]
+    baseline = {"config": "B vec/0.72/excl", "precision_at_k": 0.6, "noise_at_k": 0.1}
+
+    res = eval_recall.check_gate(rows, baseline)
+
+    assert not res.passed
+    assert "not evaluated" in res.message
+
+
 def test_check_gate_pinned_config_passes_when_it_holds_even_if_another_wins():
     rows = [
         eval_recall.Row(config="cfgA", precision_at_k=0.6, noise_at_k=0.1),
@@ -1878,3 +1918,80 @@ def test_curated_noise_probes_are_marked():
     noted = [p for p in prompts if "noise probe" in (p.get("_note") or "").lower()]
     assert noted, "curated set lost its noise probes"
     assert all(p.get("noise_probe") for p in noted)
+
+
+# --- label rot: ground truth the corpus has since retired ------------------
+
+
+def _labels_with(expect: dict[str, list[str]]) -> eval_recall.LabelSet:
+    return eval_recall.LabelSet(
+        prompts=[
+            eval_recall.Prompt(text=t, relevant=True, expect_ids=ids) for t, ids in expect.items()
+        ]
+    )
+
+
+def test_retired_prompts_names_prompts_whose_ground_truth_is_gone():
+    # memo archives and merges memories nightly, by design. A label pointing at
+    # a retired memory can never be satisfied: scoring it as a retrieval miss
+    # corrupts precision@k and makes the number incomparable to a baseline
+    # measured while the memory was still live.
+    labels = _labels_with(
+        {
+            "where do the lambdas deploy": ["19a31cd7"],  # retired
+            "how does dedup work": ["aaaa1111", "bbbb2222"],  # one still live
+            "what is the chat port": ["cccc3333"],  # live
+        }
+    )
+    live = {"bbbb2222", "cccc3333"}
+
+    retired = eval_recall.retired_prompts(labels, lambda pref: pref in live)
+
+    # Only the prompt whose ENTIRE ground truth is gone is quarantined; a
+    # partially-retired label can still be satisfied by its surviving id.
+    assert [t for t, _ in retired] == ["where do the lambdas deploy"]
+    assert retired[0][1] == ["19a31cd7"]
+
+
+def test_retired_prompts_ignores_prompts_without_expect_ids():
+    labels = eval_recall.LabelSet(
+        prompts=[eval_recall.Prompt(text="no ground truth here", relevant=True)]
+    )
+
+    assert eval_recall.retired_prompts(labels, lambda pref: False) == []
+
+
+def test_check_gate_fails_when_the_label_set_eroded_further():
+    # Erosion is gated on CHANGE, not on an invented threshold: the baseline
+    # records how many prompts were already unscoreable, so the gate catches
+    # new rot without blocking on the rot it was seeded with.
+    rows = [eval_recall.Row(config="cfgA", precision_at_k=0.6, noise_at_k=0.1, quarantined=4)]
+    baseline = {"config": "cfgA", "precision_at_k": 0.6, "noise_at_k": 0.1, "quarantined": 2}
+
+    res = eval_recall.check_gate(rows, baseline)
+
+    assert not res.passed
+    assert "label set eroded" in res.message
+    assert "4 prompts" in res.message and "up from 2" in res.message
+    # It must point at label repair, never at blessing the erosion.
+    assert "Re-point them" in res.message
+
+
+def test_check_gate_tolerates_unchanged_or_repaired_label_rot():
+    baseline = {"config": "cfgA", "precision_at_k": 0.6, "noise_at_k": 0.1, "quarantined": 2}
+
+    same = eval_recall.Row(config="cfgA", precision_at_k=0.6, noise_at_k=0.1, quarantined=2)
+    repaired = eval_recall.Row(config="cfgA", precision_at_k=0.6, noise_at_k=0.1, quarantined=0)
+
+    assert eval_recall.check_gate([same], baseline).passed
+    assert eval_recall.check_gate([repaired], baseline).passed
+
+
+def test_baseline_payload_records_the_quarantine_it_was_measured_with():
+    rows = [eval_recall.Row(config="cfgA", precision_at_k=0.6, noise_at_k=0.1, quarantined=3)]
+
+    payload = eval_recall.baseline_payload(
+        rows, k=5, labels_fingerprint="labels-abc", corpus_fingerprint="corpus-123"
+    )
+
+    assert payload["quarantined"] == 3
